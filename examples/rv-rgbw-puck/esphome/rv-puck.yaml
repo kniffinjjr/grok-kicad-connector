@@ -1,0 +1,67 @@
+esphome:
+  name: rv-rgbw-puck
+  friendly_name: RV RGBW Puck
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: arduino
+  # If using a bare ESP32-C3 module, adjust variant / flash size as needed
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "RV-Puck-Fallback"
+    password: "changeme"
+
+api:
+ota:
+  platform: esphome
+
+logger:
+
+# Optional: captive portal for first setup
+captive_portal:
+
+# ---------------------------------------------------------------------------
+# PWM outputs — discrete RGBW channels
+# GPIO assignment (change if your layout differs):
+#   GPIO4 = Red
+#   GPIO5 = Green
+#   GPIO6 = Blue
+#   GPIO7 = White
+# ---------------------------------------------------------------------------
+output:
+  - platform: ledc
+    pin: GPIO4
+    id: out_red
+    frequency: 1000Hz
+  - platform: ledc
+    pin: GPIO5
+    id: out_green
+    frequency: 1000Hz
+  - platform: ledc
+    pin: GPIO6
+    id: out_blue
+    frequency: 1000Hz
+  - platform: ledc
+    pin: GPIO7
+    id: out_white
+    frequency: 1000Hz
+
+light:
+  - platform: rgbw
+    name: "RV Puck"
+    id: rv_puck_light
+    red: out_red
+    green: out_green
+    blue: out_blue
+    white: out_white
+    default_transition_length: 0.5s
+    # Optional gamma / color correction can be added later
+
+# Optional future: NTC on an ADC pin for thermal foldback
+# sensor:
+#   - platform: ntc
+#     ...
