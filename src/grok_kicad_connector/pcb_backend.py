@@ -40,6 +40,16 @@ except ImportError:
     from_mm = to_mm = None  # type: ignore
     _HAS_KIPY = False
 
+try:
+    from kipy.common_types import LibraryIdentifier
+except Exception:
+    LibraryIdentifier = None  # type: ignore
+
+try:
+    from kipy.proto.board.board_types_pb2 import BoardLayer
+except Exception:
+    BoardLayer = None  # type: ignore
+
 
 # ---------------------------------------------------------------------------
 # Structured result (matches Harness Spec §7)
@@ -71,10 +81,6 @@ def _make_checkpoint_id() -> str:
 
 
 def create_file_checkpoint(board_path: Path | None, project_dir: Path | None = None) -> str | None:
-    """
-    Copy the current .kicad_pcb (if known) into a durable checkpoint directory.
-    Returns the checkpoint_id or None if no board path is available.
-    """
     if board_path is None or not board_path.exists():
         return None
 
@@ -87,13 +93,131 @@ def create_file_checkpoint(board_path: Path | None, project_dir: Path | None = N
 
 
 def rollback_file_checkpoint(ckpt_id: str, board_path: Path, project_dir: Path | None = None) -> bool:
-    """Restore a previous checkpoint over the live board file."""
     root = (project_dir or board_path.parent) / CHECKPOINT_ROOT
     src = root / f"{ckpt_id}.kicad_pcb"
     if not src.exists():
         return False
     shutil.copy2(src, board_path)
     return True
+
+
+def _parse_lib_id(lib_id: str) -> tuple[str, str]:
+    """Split 'LibraryNickname:FootprintName' into (library, name)."""
+    if ":" in lib_id:
+        lib, name = lib_id.split(":", 1)
+        return lib.strip(), name.strip()
+    return "", lib_id.strip()
+
+
+def _set_orientation(fp: Any, rotation_deg: float) -> None:
+    """Best-effort orientation across kipy versions (degrees / decidegrees / Angle)."""
+    if not rotation_deg or not hasattr(fp, "orientation"):
+        return
+    try:
+        from kipy.geometry import Angle
+
+        fp.orientation = Angle.from_degrees(rotation_deg)
+        return
+    except Exception:
+        pass
+    try:
+        fp.orientation = rotation_deg * 10  # decidegrees
+    except Exception:
+        try:
+            fp.orientation = rotation_deg
+        except Exception:
+            pass
+
+
+def _set_layer(fp: Any, layer: str) -> None:
+    if BoardLayer is None:
+        return
+    layer_map = {
+        "F.Cu": getattr(BoardLayer, "BL_F_Cu", None),
+        "B.Cu": getattr(BoardLayer, "BL_B_Cu", None),
+    }
+    val = layer_map.get(layer)
+    if val is not None and hasattr(fp, "layer"):
+        try:
+            fp.layer = val
+        except Exception:
+            pass
+
+
+def _set_reference_value(fp: Any, reference: str, value: str | None) -> None:
+    """Set reference/value via field objects when available (KiCad 9+ style)."""
+    # Preferred: reference_field / value_field (documented path)
+    try:
+        if hasattr(fp, "reference_field") and fp.reference_field is not None:
+            text = getattr(fp.reference_field, "text", None)
+            if text is not None and hasattr(text, "value"):
+                text.value = reference
+            elif hasattr(fp.reference_field, "value"):
+                fp.reference_field.value = reference
+            if hasattr(fp.reference_field, "visible"):
+                fp.reference_field.visible = True
+    except Exception:
+        pass
+
+    if value is not None:
+        try:
+            if hasattr(fp, "value_field") and fp.value_field is not None:
+                text = getattr(fp.value_field, "text", None)
+                if text is not None and hasattr(text, "value"):
+                    text.value = value
+                elif hasattr(fp.value_field, "value"):
+                    fp.value_field.value = value
+        except Exception:
+            pass
+
+    # Fallback direct attrs
+    for attr, val in (("reference", reference), ("value", value)):
+        if val is None:
+            continue
+        if hasattr(fp, attr):
+            try:
+                setattr(fp, attr, val)
+            except Exception:
+                pass
+
+
+def _set_lib_id(fp: Any, lib_id: str) -> None:
+    """Attach LibraryIdentifier to the footprint definition when possible."""
+    lib, name = _parse_lib_id(lib_id)
+    if not name:
+        return
+
+    try:
+        definition = getattr(fp, "definition", None)
+        if definition is None:
+            return
+        if LibraryIdentifier is not None and hasattr(definition, "id"):
+            lid = LibraryIdentifier()
+            if lib:
+                lid.library = lib
+            lid.name = name
+            definition.id = lid
+            return
+        # Proto-style fallback
+        if hasattr(definition, "id") and definition.id is not None:
+            if lib and hasattr(definition.id, "library"):
+                definition.id.library = lib
+            if hasattr(definition.id, "name"):
+                definition.id.name = name
+    except Exception:
+        pass
+
+
+def _find_footprint_by_ref(board: Any, reference: str) -> Any | None:
+    for fp in board.get_footprints():
+        ref = getattr(fp, "reference", None)
+        if ref is None and hasattr(fp, "reference_field"):
+            rf = fp.reference_field
+            text = getattr(rf, "text", None)
+            ref = getattr(text, "value", None) if text is not None else getattr(rf, "value", None)
+        if str(ref) == reference:
+            return fp
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -120,12 +244,10 @@ class PcbBackend:
         self._board_path: Path | None = None
 
     def connect(self) -> ToolResult:
-        """Establish (or re-establish) connection to a running KiCad instance."""
         try:
             self._kicad = KiCad(client_name=self.client_name)
             version = str(self._kicad.get_version())
             self._board = self._kicad.get_board()
-            # Best-effort path discovery (not always exposed)
             self._board_path = None
             return ToolResult(
                 ok=True,
@@ -142,6 +264,10 @@ class PcbBackend:
                 evidence={"error": str(e)},
             )
 
+    def set_board_path(self, path: str | Path) -> None:
+        """Tell the backend where the live .kicad_pcb lives (for checkpoints)."""
+        self._board_path = Path(path)
+
     def _ensure_board(self) -> Any:
         if self._board is None:
             result = self.connect()
@@ -154,9 +280,6 @@ class PcbBackend:
     # ------------------------------------------------------------------
 
     def get_board_status(self) -> ToolResult:
-        """
-        Snapshot of the open board: footprints, nets, tracks, vias, stackup summary.
-        """
         try:
             board = self._ensure_board()
             footprints = list(board.get_footprints())
@@ -167,16 +290,16 @@ class PcbBackend:
             fp_summary = []
             for fp in footprints:
                 try:
-                    ref = getattr(fp, "reference", None) or getattr(
-                        getattr(fp, "reference_field", None), "text", None
-                    )
-                    if hasattr(ref, "value"):
-                        ref = ref.value
+                    ref = getattr(fp, "reference", None)
+                    if ref is None and hasattr(fp, "reference_field"):
+                        rf = fp.reference_field
+                        text = getattr(rf, "text", None)
+                        ref = getattr(text, "value", None) if text is not None else getattr(rf, "value", None)
                     pos = getattr(fp, "position", None)
                     pos_mm = None
                     if pos is not None:
                         try:
-                            pos_mm = (to_mm(pos.x), to_mm(pos.y))
+                            pos_mm = (round(to_mm(pos.x), 4), round(to_mm(pos.y), 4))
                         except Exception:
                             pos_mm = (getattr(pos, "x", None), getattr(pos, "y", None))
                     fp_summary.append(
@@ -204,7 +327,7 @@ class PcbBackend:
                 "track_count": len(tracks),
                 "via_count": len(vias),
                 "net_count": len(nets),
-                "footprints": fp_summary[:200],  # cap for agent context
+                "footprints": fp_summary[:200],
                 "stackup": stackup_info,
             }
 
@@ -219,8 +342,10 @@ class PcbBackend:
                 ok=True,
                 status="success",
                 evidence=evidence,
-                message=f"Board status: {len(footprints)} footprints, "
-                        f"{len(tracks)} tracks, {len(vias)} vias, {len(nets)} nets",
+                message=(
+                    f"Board status: {len(footprints)} footprints, "
+                    f"{len(tracks)} tracks, {len(vias)} vias, {len(nets)} nets"
+                ),
                 kicad_version=version,
             )
         except Exception as e:
@@ -232,7 +357,7 @@ class PcbBackend:
             )
 
     # ------------------------------------------------------------------
-    # Mutations
+    # Mutations — footprints
     # ------------------------------------------------------------------
 
     def place_footprint(
@@ -246,12 +371,17 @@ class PcbBackend:
         create_checkpoint: bool = True,
     ) -> ToolResult:
         """
-        Place a footprint instance on the board.
+        Place a footprint instance on the board (KiCad 9/10 IPC).
 
-        Note: Full library footprint instantiation via IPC is still evolving.
-        This implementation creates a minimal FootprintInstance shell and relies
-        on the running KiCad session / library cache. Prefer placing from the
-        schematic netlist when possible.
+        Sets LibraryIdentifier, reference/value fields, position, layer, and
+        orientation using the patterns that work against current kicad-python.
+
+        Limitations on 9/10:
+          - IPC does not fully expand library pad geometry the way pcbnew.FootprintLoad did.
+          - For production placement prefer Update PCB from Schematic, or clone an
+            existing footprint then move/relabel it via move_footprint.
+          - This tool still creates a valid instance with correct identity + fields
+            so agents can iterate layout before a netlist refresh.
         """
         try:
             board = self._ensure_board()
@@ -261,38 +391,33 @@ class PcbBackend:
 
             commit = board.begin_commit()
             try:
-                # Build a minimal footprint instance.
-                # Exact construction varies slightly by kicad-python version;
-                # we keep the surface conservative.
                 fp = FootprintInstance()
-                # Common attribute patterns across recent kipy versions
-                if hasattr(fp, "reference"):
-                    fp.reference = reference
-                if value is not None and hasattr(fp, "value"):
-                    fp.value = value
-
-                fp.position = Vector2.from_xy(from_mm(position_mm[0]), from_mm(position_mm[1]))
-                if hasattr(fp, "orientation") and rotation_deg:
-                    # orientation is typically in decidegrees or radians depending on version
-                    try:
-                        fp.orientation = rotation_deg * 10  # decidegrees common in KiCad
-                    except Exception:
-                        pass
+                _set_lib_id(fp, lib_id)
+                _set_reference_value(fp, reference, value)
+                fp.position = Vector2.from_xy(
+                    from_mm(position_mm[0]), from_mm(position_mm[1])
+                )
+                _set_orientation(fp, rotation_deg)
+                _set_layer(fp, layer)
 
                 created = board.create_items(fp)
                 board.push_commit(commit, f"Place {reference} ({lib_id})")
 
-                evidence = {
-                    "reference": reference,
-                    "lib_id": lib_id,
-                    "position_mm": position_mm,
-                    "rotation_deg": rotation_deg,
-                    "created_count": len(created) if created else 1,
-                }
                 return ToolResult(
                     ok=True,
                     status="success",
-                    evidence=evidence,
+                    evidence={
+                        "reference": reference,
+                        "lib_id": lib_id,
+                        "position_mm": list(position_mm),
+                        "rotation_deg": rotation_deg,
+                        "layer": layer,
+                        "created_count": len(created) if created else 1,
+                        "note": (
+                            "Instance created with lib_id + fields. "
+                            "Pad geometry may require netlist update or clone."
+                        ),
+                    },
                     checkpoint_id=ckpt_id,
                     message=f"Placed {reference} at {position_mm}",
                 )
@@ -316,6 +441,84 @@ class PcbBackend:
                 evidence={"error": str(e)},
             )
 
+    def move_footprint(
+        self,
+        reference: str,
+        position_mm: tuple[float, float],
+        rotation_deg: float | None = None,
+        create_checkpoint: bool = True,
+    ) -> ToolResult:
+        """
+        Move (and optionally rotate) an existing footprint by reference.
+
+        This is the reliable path on KiCad 9/10 for layout work: operate on
+        footprints already on the board (from netlist / prior placement).
+        """
+        try:
+            board = self._ensure_board()
+            fp = _find_footprint_by_ref(board, reference)
+            if fp is None:
+                return ToolResult(
+                    ok=False,
+                    status="soft_fail",
+                    message=f"Footprint {reference!r} not found on board",
+                    evidence={"reference": reference},
+                )
+
+            ckpt_id = None
+            if create_checkpoint and self._board_path:
+                ckpt_id = create_file_checkpoint(self._board_path)
+
+            commit = board.begin_commit()
+            try:
+                fp.position = Vector2.from_xy(
+                    from_mm(position_mm[0]), from_mm(position_mm[1])
+                )
+                if rotation_deg is not None:
+                    _set_orientation(fp, rotation_deg)
+
+                board.update_items([fp])
+                board.push_commit(
+                    commit,
+                    f"Move {reference} to {position_mm}"
+                    + (f" rot={rotation_deg}" if rotation_deg is not None else ""),
+                )
+
+                return ToolResult(
+                    ok=True,
+                    status="success",
+                    evidence={
+                        "reference": reference,
+                        "position_mm": list(position_mm),
+                        "rotation_deg": rotation_deg,
+                    },
+                    checkpoint_id=ckpt_id,
+                    message=f"Moved {reference} to {position_mm}",
+                )
+            except Exception as e:
+                try:
+                    board.drop_commit(commit)
+                except Exception:
+                    pass
+                return ToolResult(
+                    ok=False,
+                    status="hard_fail",
+                    message=f"move_footprint failed: {e}",
+                    evidence={"error": str(e)},
+                    checkpoint_id=ckpt_id,
+                )
+        except Exception as e:
+            return ToolResult(
+                ok=False,
+                status="hard_fail",
+                message=f"move_footprint failed: {e}",
+                evidence={"error": str(e)},
+            )
+
+    # ------------------------------------------------------------------
+    # Mutations — tracks / vias
+    # ------------------------------------------------------------------
+
     def add_track(
         self,
         start_mm: tuple[float, float],
@@ -325,7 +528,6 @@ class PcbBackend:
         net_name: str | None = None,
         create_checkpoint: bool = True,
     ) -> ToolResult:
-        """Create a single straight track segment."""
         try:
             board = self._ensure_board()
             ckpt_id = None
@@ -339,18 +541,17 @@ class PcbBackend:
                 track.end = Vector2.from_xy(from_mm(end_mm[0]), from_mm(end_mm[1]))
                 track.width = from_mm(width_mm)
 
-                # Layer assignment – best-effort across versions
-                try:
-                    from kipy.proto.board.board_types_pb2 import BoardLayer
-
+                if BoardLayer is not None:
                     layer_map = {
-                        "F.Cu": BoardLayer.BL_F_Cu,
-                        "B.Cu": BoardLayer.BL_B_Cu,
+                        "F.Cu": getattr(BoardLayer, "BL_F_Cu", None),
+                        "B.Cu": getattr(BoardLayer, "BL_B_Cu", None),
                     }
-                    if layer in layer_map:
-                        track.layer = layer_map[layer]
-                except Exception:
-                    pass
+                    val = layer_map.get(layer)
+                    if val is not None:
+                        try:
+                            track.layer = val
+                        except Exception:
+                            pass
 
                 if net_name and hasattr(board, "get_nets"):
                     for net in board.get_nets():
@@ -365,8 +566,8 @@ class PcbBackend:
                     ok=True,
                     status="success",
                     evidence={
-                        "start_mm": start_mm,
-                        "end_mm": end_mm,
+                        "start_mm": list(start_mm),
+                        "end_mm": list(end_mm),
                         "width_mm": width_mm,
                         "layer": layer,
                         "net_name": net_name,
@@ -403,7 +604,6 @@ class PcbBackend:
         net_name: str | None = None,
         create_checkpoint: bool = True,
     ) -> ToolResult:
-        """Create a through-via."""
         try:
             board = self._ensure_board()
             ckpt_id = None
@@ -416,7 +616,6 @@ class PcbBackend:
                 via.position = Vector2.from_xy(
                     from_mm(position_mm[0]), from_mm(position_mm[1])
                 )
-                # Common attribute names across versions
                 for attr, val in [
                     ("diameter", from_mm(diameter_mm)),
                     ("drill_diameter", from_mm(drill_mm)),
@@ -448,7 +647,7 @@ class PcbBackend:
                     ok=True,
                     status="success",
                     evidence={
-                        "position_mm": position_mm,
+                        "position_mm": list(position_mm),
                         "diameter_mm": diameter_mm,
                         "drill_mm": drill_mm,
                         "net_name": net_name,
@@ -515,7 +714,6 @@ class PcbBackend:
                 status="hard_fail",
                 message=f"Checkpoint {ckpt_id} not found",
             )
-        # After file restore the user should reload the board in KiCad
         return ToolResult(
             ok=True,
             status="success",
@@ -525,7 +723,7 @@ class PcbBackend:
         )
 
     # ------------------------------------------------------------------
-    # DRC via kicad-cli (IPC DRC is limited until KiCad 11)
+    # DRC via kicad-cli
     # ------------------------------------------------------------------
 
     def run_drc(
@@ -534,7 +732,6 @@ class PcbBackend:
         output: str | Path | None = None,
         format: str = "json",
     ) -> ToolResult:
-        """Run Design Rule Check via kicad-cli and return evidence."""
         board_path = Path(board_path)
         if output is None:
             output = board_path.with_suffix(".drc.json")
