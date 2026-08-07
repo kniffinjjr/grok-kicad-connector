@@ -18,10 +18,20 @@ dependencies = [
 schematic = [
     "kicad-sch-api>=0.5",
 ]
+mcp = [
+    "mcp>=1.0",
+]
+all = [
+    "kicad-sch-api>=0.5",
+    "mcp>=1.0",
+]
 dev = [
     "pytest>=7",
     "ruff>=0.4",
 ]
+
+[project.scripts]
+grok-kicad-mcp = "grok_kicad_connector.mcp_server:main"
 
 [project.urls]
 Homepage = "https://github.com/kniffinjjr/grok-kicad-connector"
