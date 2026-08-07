@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grok-kicad-connector"
+version = "0.1.0"
+description = "AI harness connecting xAI Grok to KiCad via IPC API + file-based schematic bridge"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Joseph R. Kniffin Jr." }]
+dependencies = [
+    "kicad-python>=0.4",
+]
+
+[project.optional-dependencies]
+schematic = [
+    "kicad-sch-api>=0.5",
+]
+dev = [
+    "pytest>=7",
+    "ruff>=0.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/kniffinjjr/grok-kicad-connector"
+Repository = "https://github.com/kniffinjjr/grok-kicad-connector"
+
+[tool.setuptools.packages.find]
+where = ["src"]
